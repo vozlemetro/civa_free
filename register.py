@@ -1,16 +1,16 @@
-# register.py – Epic Games регистрация с уникальным displayName, Playwright Async (июль-2025)
+# register.py – Epic Games регистрация с корректным вводом e-mail (июль-2025)
 
 import random
 import asyncio
 import re
 import traceback
 import uuid
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Browser
 from faker import Faker
 
 faker = Faker()
-
 REGISTER_URL = "https://www.epicgames.com/id/register/date-of-birth?lang=ru"
+
 
 async def cookie_guard(page):
     """Закрывает возможный cookie-баннер."""
@@ -19,6 +19,7 @@ async def cookie_guard(page):
         if await btn.is_visible():
             await btn.click()
             break
+
 
 async def pick_from_combobox(frame, label_ru, val):
     """Выбирает из combobox «День» или «Месяц»."""
@@ -32,6 +33,7 @@ async def pick_from_combobox(frame, label_ru, val):
         await opt.click()
     else:
         await frame.get_by_role("option").nth(int(val)-1).click()
+
 
 async def find_frame_with_selector(page, css_list, timeout=15_000):
     """
@@ -52,17 +54,18 @@ async def find_frame_with_selector(page, css_list, timeout=15_000):
         await asyncio.sleep(0.5)
     raise RuntimeError(f"Не найден фрейм для селекторов: {css_list}")
 
-async def register_epic_account(email: str, password: str):
+
+async def register_epic_account(email: str, password: str) -> None:
     print(f"\n🚀 Старт регистрации: {email}")
+    browser: Browser | None = None
     try:
         async with async_playwright() as p:
-            # Запускаем Chromium
             browser = await p.chromium.launch(
                 headless=False,
                 args=["--no-sandbox", "--disable-blink-features=AutomationControlled"]
             )
             context = await browser.new_context(locale="ru-RU")
-            page    = await context.new_page()
+            page = await context.new_page()
 
             # 1) Дата рождения
             await page.goto(REGISTER_URL, wait_until="domcontentloaded")
@@ -83,43 +86,47 @@ async def register_epic_account(email: str, password: str):
             # 2) Форма учётной записи
             await page.wait_for_url(re.compile(r"/register\?lang="), timeout=15_000)
             reg_frame = await find_frame_with_selector(
-                page, ["input[name='email']", "input[name='name']"]
+                page, ["input[name='email']:visible", "input[name='displayName']"]
             )
 
-            # ========== Генерация уникального displayName =============
+            # ==== ввод e-mail из tempmail с проверкой ====
+            print(f"🔧 DEBUG: вводим {email} в форму")
+            email_input = reg_frame.locator("input[name='email']:visible").first
+            await email_input.click()
+            await email_input.fill("")                   # очищаем
+            await email_input.type(email, delay=70)      # «ручной» ввод
+            await email_input.press("Tab")               # триггерим blur
+            await page.wait_for_timeout(1000)            # ждём JS-валидацию
+
+            # если Epic подчистил или отклонил e-mail
+            current = await email_input.input_value()
+            if current != email:
+                raise RuntimeError(f"Epic перезаписал email → «{current}»")
+
+            # ==== остальные поля ====
             first = faker.first_name()
             last  = faker.last_name()
-            unique_suffix = uuid.uuid4().hex[:6]
-            display_name = f"{first.lower()}.{last.lower()}{unique_suffix}"
+            display_name = f"{first.lower()}.{last.lower()}{uuid.uuid4().hex[:6]}"
             print(f"Используем displayName: {display_name}")
 
-            # Заполняем поля
-            await reg_frame.fill("input[name='email']",       email)
-            await reg_frame.fill(
-                "input[name='name'], input[name='firstName']",
-                first
-            )
-            await reg_frame.fill(
-                "input[name='familyName'], input[name='lastName']",
-                last
-            )
+            await reg_frame.fill("input[name='name'], input[name='firstName']", first)
+            await reg_frame.fill("input[name='familyName'], input[name='lastName']", last)
             await reg_frame.fill("input[name='displayName']", display_name)
             await reg_frame.fill("input[name='password']",    password)
 
-            # Случайный выбор страны
+            # случайный выбор страны
             country_btn = reg_frame.get_by_role("combobox", name=re.compile("Страна", re.I))
             if await country_btn.count():
                 await country_btn.click()
-                country = faker.country()
                 country_opt = reg_frame.get_by_role(
-                    "option", name=re.compile(re.escape(country), re.I)
+                    "option", name=re.compile(re.escape(faker.country()), re.I)
                 )
                 if await country_opt.count():
                     await country_opt.click()
                 else:
                     await reg_frame.get_by_role("option").first.click()
 
-            # Надёжная установка галочки Terms of Service
+            # Terms of Service
             tos = reg_frame.get_by_label("Я прочитал(-а) и принимаю Условия обслуживания")
             if await tos.count():
                 await tos.check()
@@ -130,14 +137,12 @@ async def register_epic_account(email: str, password: str):
 
             print("✍️ Анкета заполнена")
 
-            # Отправляем форму
-            submit_btn = reg_frame.locator(
+            # 3) Отправляем форму и ждём подтверждения
+            await reg_frame.locator(
                 "button[type='submit'], button:has-text('Продолжить')"
-            )
-            await submit_btn.first.click()
+            ).first.click()
 
-            # 3) Подтверждение отправки
-            await reg_frame.wait_for_selector(
+            await page.wait_for_selector(
                 "text=/Проверьте адрес|Check your email/", timeout=25_000
             )
             print("✅ Учётка создана, письмо отправлено")
@@ -148,11 +153,7 @@ async def register_epic_account(email: str, password: str):
     except Exception:
         print("❌ Ошибка регистрации:")
         traceback.print_exc()
-
-
-# standalone-тест
-if __name__ == "__main__":
-    import asyncio, secrets
-    email    = f"epic_{secrets.token_hex(4)}@mail.tm"
-    password = faker.password(length=12)
-    asyncio.run(register_epic_account(email, password))
+        if browser:
+            await browser.close()
+        # прокидываем наверх, чтобы main.py создал новый email
+        raise
