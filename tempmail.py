@@ -1,13 +1,25 @@
+
 import asyncio
 import httpx
 import uuid
+import random
 from utils import random_password
 API_BASE = "https://api.mail.tm"
 
+
+# New helper to get a random domain
+async def get_random_domain():
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(f"{API_BASE}/domains")
+        data = resp.json()
+        domains = [d["domain"] for d in data["hydra:member"]]
+        return random.choice(domains)
+
 async def create_account_async():
     # Генерируем уникальные учётные данные
+    domain = await get_random_domain()
     name = f"epic_{uuid.uuid4().hex[:8]}"
-    email = f"{name}@mail.tm"
+    email = f"{name}@{domain}"
     password = random_password(12)
 
     async with httpx.AsyncClient() as client:
@@ -17,7 +29,7 @@ async def create_account_async():
             json={"address": email, "password": password}
         )
         if resp.status_code != 201:
-            raise Exception("Ошибка при создании почты", resp.text)
+            raise Exception(f"Ошибка при создании почты: [{resp.status_code}] {resp.text}")
 
         # 2) Получение токена
         token_resp = await client.post(

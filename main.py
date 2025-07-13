@@ -9,8 +9,8 @@ async def handle_account():
     acc = await create_account_async()
     email, password, token = acc["email"], acc["password"], acc["token"]
 
-    # 2. Регистрация на Epic Games
-    register_epic_account(email=email, password=password)
+    # 2. Регистрация на Epic Games#   
+    await register_epic_account(email=email, password=password)
 
     # 3. Ожидание письма
     print(f"Ждём письмо на {email}...")
@@ -33,8 +33,10 @@ async def handle_account():
     print(f"💾 Сохранили аккаунт {email}")
 
 async def main():
-    tasks = [handle_account() for _ in range(5)]
-    await asyncio.gather(*tasks)
+    for _ in range(3):
+        await handle_account()
+        await asyncio.sleep(10) 
+        
 
 if __name__ == "__main__":
     asyncio.run(main())
