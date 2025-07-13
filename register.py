@@ -1,77 +1,158 @@
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.keys import Keys
-import time, random
+# register.py – Epic Games регистрация с уникальным displayName, Playwright Async (июль-2025)
 
-from utils import random_string, random_password
+import random
+import asyncio
+import re
+import traceback
+import uuid
+from playwright.async_api import async_playwright
+from faker import Faker
 
-def register_epic_account(email: str, password: str, proxy: str = None):
+faker = Faker()
+
+REGISTER_URL = "https://www.epicgames.com/id/register/date-of-birth?lang=ru"
+
+async def cookie_guard(page):
+    """Закрывает возможный cookie-баннер."""
+    for txt in ("Принять", "Accept"):
+        btn = page.locator(f"button:has-text('{txt}')")
+        if await btn.is_visible():
+            await btn.click()
+            break
+
+async def pick_from_combobox(frame, label_ru, val):
+    """Выбирает из combobox «День» или «Месяц»."""
+    btn = frame.get_by_role("combobox", name=label_ru)
+    await btn.click()
+    month_map = ["янв","фев","мар","апр","май","июн",
+                 "июл","авг","сен","окт","ноя","дек"]
+    target = month_map[int(val)-1] if label_ru == "Месяц" else val
+    opt = frame.get_by_role("option", name=re.compile(rf"^{re.escape(target)}$", re.I))
+    if await opt.count():
+        await opt.click()
+    else:
+        await frame.get_by_role("option").nth(int(val)-1).click()
+
+async def find_frame_with_selector(page, css_list, timeout=15_000):
     """
-    Регистрирует аккаунт Epic Games через selenium.
+    Ищет iframe или root, где есть любой селектор из css_list.
     """
-    # Настройка Chrome
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument(f"--user-agent={generate_user_agent()}")
+    await page.wait_for_load_state("domcontentloaded")
+    await cookie_guard(page)
+    for _ in range(timeout // 500):
+        # проверяем корневой фрейм
+        for css in css_list:
+            if await page.query_selector(css):
+                return page.main_frame
+        # проверяем вложенные iframe
+        for fr in page.frames:
+            for css in css_list:
+                if await fr.query_selector(css):
+                    return fr
+        await asyncio.sleep(0.5)
+    raise RuntimeError(f"Не найден фрейм для селекторов: {css_list}")
 
-    if proxy:
-        options.add_argument(f'--proxy-server={proxy}')
-
-    driver = webdriver.Chrome(options=options)
-    wait = WebDriverWait(driver, 20)
-
+async def register_epic_account(email: str, password: str):
+    print(f"\n🚀 Старт регистрации: {email}")
     try:
-        driver.get("https://www.epicgames.com/id/register")
-        time.sleep(random.uniform(3, 5))  # Ждём полной загрузки
+        async with async_playwright() as p:
+            # Запускаем Chromium
+            browser = await p.chromium.launch(
+                headless=False,
+                args=["--no-sandbox", "--disable-blink-features=AutomationControlled"]
+            )
+            context = await browser.new_context(locale="ru-RU")
+            page    = await context.new_page()
 
-        # Выбираем страну (оставим по умолчанию, если уже стоит)
+            # 1) Дата рождения
+            await page.goto(REGISTER_URL, wait_until="domcontentloaded")
+            dob_frame = await find_frame_with_selector(
+                page, ["input[placeholder='Год']", "select[name='day']"]
+            )
+            year      = str(random.randint(1993, 2005))
+            month_num = str(random.randint(1, 12))
+            day_num   = str(random.randint(1, 28))
+            await pick_from_combobox(dob_frame, "День",  day_num)
+            await pick_from_combobox(dob_frame, "Месяц", month_num)
+            await dob_frame.fill("input[placeholder='Год']", year)
+            print(f"📅 ДР: {day_num}.{month_num}.{year}")
+            await dob_frame.get_by_role(
+                "button", name=re.compile("Продолжить|Continue", re.I)
+            ).click()
 
-        # Имя и фамилия
-        name = random_string(6)
-        surname = random_string(7)
-        driver.find_element(By.NAME, "name").send_keys(name)
-        driver.find_element(By.NAME, "lastName").send_keys(surname)
+            # 2) Форма учётной записи
+            await page.wait_for_url(re.compile(r"/register\?lang="), timeout=15_000)
+            reg_frame = await find_frame_with_selector(
+                page, ["input[name='email']", "input[name='name']"]
+            )
 
-        # Email
-        driver.find_element(By.NAME, "email").send_keys(email)
-        driver.find_element(By.NAME, "password").send_keys(password)
-        driver.find_element(By.NAME, "displayName").send_keys(name + random_string(4))
+            # ========== Генерация уникального displayName =============
+            first = faker.first_name()
+            last  = faker.last_name()
+            unique_suffix = uuid.uuid4().hex[:6]
+            display_name = f"{first.lower()}.{last.lower()}{unique_suffix}"
+            print(f"Используем displayName: {display_name}")
 
-        # Согласие с условиями
-        driver.find_element(By.CLASS_NAME, "css-checkbox").click()
+            # Заполняем поля
+            await reg_frame.fill("input[name='email']",       email)
+            await reg_frame.fill(
+                "input[name='name'], input[name='firstName']",
+                first
+            )
+            await reg_frame.fill(
+                "input[name='familyName'], input[name='lastName']",
+                last
+            )
+            await reg_frame.fill("input[name='displayName']", display_name)
+            await reg_frame.fill("input[name='password']",    password)
 
-        # Нажимаем кнопку зарегистрироваться
-        submit = wait.until(EC.element_to_be_clickable((By.XPATH, '//button[@type="submit"]')))
-        submit.click()
+            # Случайный выбор страны
+            country_btn = reg_frame.get_by_role("combobox", name=re.compile("Страна", re.I))
+            if await country_btn.count():
+                await country_btn.click()
+                country = faker.country()
+                country_opt = reg_frame.get_by_role(
+                    "option", name=re.compile(re.escape(country), re.I)
+                )
+                if await country_opt.count():
+                    await country_opt.click()
+                else:
+                    await reg_frame.get_by_role("option").first.click()
 
-        # Ждём либо капчу, либо редирект
-        time.sleep(5)
+            # Надёжная установка галочки Terms of Service
+            tos = reg_frame.get_by_label("Я прочитал(-а) и принимаю Условия обслуживания")
+            if await tos.count():
+                await tos.check()
+            else:
+                inp = reg_frame.locator("input[name='termsOfService']")
+                await inp.scroll_into_view_if_needed()
+                await inp.check(force=True)
 
-        # Проверка успешной регистрации — смотрим URL или заголовок
-        if "verify" in driver.current_url:
-            print(f"Аккаунт {email} создан, ожидает подтверждения.")
-        else:
-            print(f"Аккаунт {email} возможно уже зарегистрирован или капча.")
+            print("✍️ Анкета заполнена")
 
-    except Exception as e:
-        print(f"Ошибка при регистрации: {e}")
+            # Отправляем форму
+            submit_btn = reg_frame.locator(
+                "button[type='submit'], button:has-text('Продолжить')"
+            )
+            await submit_btn.first.click()
 
-    finally:
-        driver.quit()
+            # 3) Подтверждение отправки
+            await reg_frame.wait_for_selector(
+                "text=/Проверьте адрес|Check your email/", timeout=25_000
+            )
+            print("✅ Учётка создана, письмо отправлено")
 
-def generate_user_agent():
-    ua_list = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/114.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/14.1 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Ubuntu; Linux x86_64) Gecko/20100101 Firefox/90.0",
-    ]
-    return random.choice(ua_list)
+            await context.close()
+            await browser.close()
 
-# Пример:
-# register_epic_account("epic_xyz@mail.tm", "StrongPass123!", proxy="http://user:pass@ip:port")
+    except Exception:
+        print("❌ Ошибка регистрации:")
+        traceback.print_exc()
+
+
+# standalone-тест
+if __name__ == "__main__":
+    import asyncio, secrets
+    email    = f"epic_{secrets.token_hex(4)}@mail.tm"
+    password = faker.password(length=12)
+    asyncio.run(register_epic_account(email, password))
